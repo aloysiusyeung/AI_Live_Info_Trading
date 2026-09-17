@@ -116,6 +116,25 @@ class Settings:
     min_order_notional: float = 50.0
     duplicate_order_window_minutes: int = 60
 
+    # --- news (market-wide, not limited to the watchlist) ---
+    news_enabled: bool = True
+    news_backfill_days: int = 7
+    news_page_limit: int = 50
+    news_max_pages: int = 40
+    news_include_content: bool = False
+    news_exclude_contentless: bool = False
+
+    # --- dynamic universe driven by news ---
+    dynamic_universe_enabled: bool = True
+    max_dynamic_symbols: int = 40
+    min_news_for_candidate: int = 2
+    candidate_lookback_hours: int = 48
+    universe_refresh_hours: int = 12
+    # Training is expensive (three candidates x walk-forward, per symbol). Cap
+    # how many models one cycle may build so a freshly widened universe fills
+    # in over several cycles instead of overrunning the 10-minute budget.
+    max_trainings_per_cycle: int = 5
+
     # --- infrastructure ---
     database_path: str = str(PROJECT_ROOT / "data" / "stockbot.sqlite")
     model_dir: str = str(PROJECT_ROOT / "models_store")
@@ -141,6 +160,12 @@ class Settings:
 
     @property
     def all_symbols(self) -> List[str]:
+        """The always-analysed core: the watchlist plus the benchmark.
+
+        This is the *floor* of the analysis universe, not its ceiling. News
+        ingestion is market-wide and ignores this entirely; the dynamic universe
+        extends it with news-active, tradable symbols.
+        """
         symbols = list(self.watchlist)
         if self.benchmark_symbol not in symbols:
             symbols.append(self.benchmark_symbol)
@@ -171,6 +196,10 @@ class Settings:
             "bar_minutes": self.bar_minutes,
             "prediction_horizon_bars": self.prediction_horizon_bars,
             "horizon": self.horizon_label,
+            "news_enabled": self.news_enabled,
+            "news_coverage": "market-wide (all US symbols)" if self.news_enabled else "off",
+            "dynamic_universe_enabled": self.dynamic_universe_enabled,
+            "max_dynamic_symbols": self.max_dynamic_symbols,
             "api_key": _mask(self.alpaca_api_key),
             "secret_key": "<set>" if self.alpaca_secret_key else "<missing>",
             "database_path": self.database_path,
@@ -238,6 +267,18 @@ def load_settings(require_credentials: bool = True, dotenv_path: str | None = No
         min_avg_dollar_volume=env_float("MIN_AVG_DOLLAR_VOLUME", 5_000_000.0),
         min_order_notional=env_float("MIN_ORDER_NOTIONAL", 50.0),
         duplicate_order_window_minutes=env_int("DUPLICATE_ORDER_WINDOW_MINUTES", 60),
+        news_enabled=env_bool("NEWS_ENABLED", True),
+        news_backfill_days=env_int("NEWS_BACKFILL_DAYS", 7),
+        news_page_limit=env_int("NEWS_PAGE_LIMIT", 50),
+        news_max_pages=env_int("NEWS_MAX_PAGES", 40),
+        news_include_content=env_bool("NEWS_INCLUDE_CONTENT", False),
+        news_exclude_contentless=env_bool("NEWS_EXCLUDE_CONTENTLESS", False),
+        dynamic_universe_enabled=env_bool("DYNAMIC_UNIVERSE_ENABLED", True),
+        max_dynamic_symbols=env_int("MAX_DYNAMIC_SYMBOLS", 40),
+        min_news_for_candidate=env_int("MIN_NEWS_FOR_CANDIDATE", 2),
+        candidate_lookback_hours=env_int("CANDIDATE_LOOKBACK_HOURS", 48),
+        universe_refresh_hours=env_int("UNIVERSE_REFRESH_HOURS", 12),
+        max_trainings_per_cycle=env_int("MAX_TRAININGS_PER_CYCLE", 5),
         database_path=os.getenv("DATABASE_PATH", str(PROJECT_ROOT / "data" / "stockbot.sqlite")),
         model_dir=os.getenv("MODEL_DIR", str(PROJECT_ROOT / "models_store")),
         log_dir=os.getenv("LOG_DIR", str(PROJECT_ROOT / "logs")),
@@ -264,3 +305,7 @@ def _validate(settings: Settings) -> None:
         raise ConfigError(f"Unsupported ALPACA_DATA_FEED: {settings.data_feed}")
     if not settings.watchlist:
         raise ConfigError("WATCHLIST is empty")
+    if settings.news_page_limit < 1 or settings.news_page_limit > 50:
+        raise ConfigError("NEWS_PAGE_LIMIT must be between 1 and 50 (Alpaca's cap)")
+    if settings.max_dynamic_symbols < 0:
+        raise ConfigError("MAX_DYNAMIC_SYMBOLS must not be negative")

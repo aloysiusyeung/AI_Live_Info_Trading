@@ -8,7 +8,7 @@ can always stop trading, and releasing it is an explicit, confirmed action.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -177,3 +177,54 @@ def age_text(iso_timestamp: Any) -> str:
     if delta < 172800:
         return f"{int(delta // 3600)}h ago"
     return f"{int(delta // 86400)}d ago"
+
+
+# -- news (market-wide) -----------------------------------------------------
+def news_feed(db: Database, limit: int = 100) -> pd.DataFrame:
+    """Most recent articles across the whole market, with their symbol tags."""
+    rows = db.latest_news(limit=limit)
+    if not rows:
+        return pd.DataFrame()
+    ids = [r["id"] for r in rows]
+    placeholders = ",".join("?" for _ in ids)
+    links = db.query(
+        f"SELECT article_id, symbol FROM news_article_symbols "
+        f"WHERE article_id IN ({placeholders})",
+        ids,
+    )
+    by_article: dict[int, list[str]] = {}
+    for link in links:
+        by_article.setdefault(link["article_id"], []).append(link["symbol"])
+    for row in rows:
+        row["symbols"] = ", ".join(sorted(by_article.get(row["id"], [])))
+    return to_frame(rows)
+
+
+def news_for_symbol(db: Database, symbol: str, limit: int = 20) -> pd.DataFrame:
+    return to_frame(db.news_for_symbol(symbol, limit=limit))
+
+
+def news_coverage(db: Database) -> dict[str, Any]:
+    stats = db.news_coverage()
+    runs = db.recent_news_runs(limit=20)
+    stats["truncated_runs"] = sum(1 for r in runs if r.get("truncated"))
+    stats["last_run_status"] = runs[0]["status"] if runs else None
+    stats["last_run_at"] = runs[0]["started_at"] if runs else None
+    return stats
+
+
+def news_runs(db: Database, limit: int = 20) -> pd.DataFrame:
+    return to_frame(db.recent_news_runs(limit=limit))
+
+
+def top_news_symbols(db: Database, hours: int = 48, limit: int = 25) -> pd.DataFrame:
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    return to_frame(db.news_counts_by_symbol(since)[:limit])
+
+
+def analysis_universe(db: Database) -> pd.DataFrame:
+    return to_frame(db.latest_universe())
+
+
+def asset_stats(db: Database) -> dict[str, Any]:
+    return db.asset_count()

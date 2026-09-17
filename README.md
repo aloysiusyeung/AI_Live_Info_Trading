@@ -1,10 +1,11 @@
 # Alpaca Paper-Trading Stock Analyser
 
 A stock-analysis and **paper-trading** application built on Alpaca's official
-Python SDK (`alpaca-py`). It pulls 10-minute bars, engineers features, trains
-and walk-forward validates several models, produces BUY / HOLD / AVOID /
-INSUFFICIENT EVIDENCE signals with plain-English explanations, and — only when
-explicitly enabled — submits simulated orders to an Alpaca **paper** account.
+Python SDK (`alpaca-py`). It pulls 10-minute bars and **market-wide news for
+every US symbol**, engineers features, trains and walk-forward validates
+several models, produces BUY / HOLD / AVOID / INSUFFICIENT EVIDENCE signals
+with plain-English explanations, and — only when explicitly enabled — submits
+simulated orders to an Alpaca **paper** account.
 
 > **This application is paper-trading only.**
 > It refuses to start unless `ALPACA_PAPER=true`, the trading client is always
@@ -23,10 +24,14 @@ explicitly enabled — submits simulated orders to an Alpaca **paper** account.
 ## Architecture
 
 ```
-Alpaca (paper trading API + market data, IEX feed by default)
+Alpaca (paper trading API + market data + news, IEX feed by default)
         │
  alpaca_client.py ──── paper-only guard; refuses a live endpoint
         │
+ data/news_collector.py  MARKET-WIDE news: every article, every US symbol,
+        │                no watchlist filter; resumable, idempotent
+ universe.py ───────── analysis universe = watchlist + news-active tradable
+        │              symbols, capped and fully audited
  data/collector.py ─── 10-minute bars; a bar is analysed only after
         │              bar_end + BAR_SETTLE_SECONDS
  data/validation.py ── staleness, duplicate timestamps, gaps, OHLC sanity,
@@ -34,6 +39,8 @@ Alpaca (paper trading API + market data, IEX feed by default)
  features.py ───────── returns, momentum, SMA/EMA, RSI, MACD, ATR, realised
         │              vol, relative volume, VWAP distance, SPY-relative
         │              performance, time of day
+ news_features.py ──── as-of news counts, burst, recency, tone, market-wide
+        │              news intensity — windowed strictly to each bar's close
  labeling.py ───────── forward return over the horizon, net of spread+slippage
         │
  models/registry.py ── logistic regression, random forest, gradient boosting
@@ -49,7 +56,9 @@ Alpaca (paper trading API + market data, IEX feed by default)
  scheduler.py ──────── fires shortly after each completed 10-minute bar
  db.py (SQLite) ────── bars, features, predictions, signals, model_versions,
                        backtest_runs, paper_orders, positions, account
-                       snapshots, errors, scheduler_runs
+                       snapshots, errors, scheduler_runs, news_articles,
+                       news_article_symbols, news_ingest_runs, assets,
+                       universe_snapshots
  dashboard/app.py ──── Streamlit UI (read-only, plus the emergency stop)
 ```
 
@@ -59,6 +68,75 @@ Two processes, one database:
 |---|---|---|
 | Scheduler | `python -m stockbot.cli run` | everything |
 | Dashboard | `streamlit run dashboard/app.py` | the kill switch only |
+
+### News coverage vs analysis coverage
+
+These are deliberately different sizes, and conflating them would be dishonest.
+
+**News is market-wide and unconditional.** `NewsRequest` is issued with **no
+symbol filter**, so Alpaca returns every article it has for every US symbol,
+each tagged with the tickers it mentions. Every one is stored, along with its
+symbol links, whatever the watchlist says. A test asserts the request carries no
+symbol filter, and another asserts that off-watchlist symbols land in the store.
+
+**Analysis cannot be market-wide.** A signal requires months of bar history plus
+a model that has passed walk-forward validation — per symbol. There are roughly
+eleven thousand listed US equities; training and refreshing that many models on
+a ten-minute cadence is not feasible, and emitting signals from unvalidated
+models would be worse than emitting none.
+
+So the analysis universe is built in two parts:
+
+| Part | Contents | Cap |
+|---|---|---|
+| `core` | `WATCHLIST` + benchmark | always analysed |
+| `news` | symbols the news is most active on, screened for tradability | `MAX_DYNAMIC_SYMBOLS` (default 40) |
+
+A symbol needs `MIN_NEWS_FOR_CANDIDATE` articles within
+`CANDIDATE_LOOKBACK_HOURS` to be a candidate, and must be tradable on Alpaca —
+a news mention is not evidence that a ticker is tradable, so without the asset
+list nothing new is admitted. Every admission and rejection is written to
+`universe_snapshots` with a reason (`news_active_and_tradable`,
+`capacity_cap_reached`, `not_tradable_on_alpaca`, `asset_list_unavailable`), and
+the dashboard's **News → Coverage** tab shows exactly which news-active symbols
+were not analysed and why. Nothing is dropped silently.
+
+Inspect the gap at any time:
+
+```bash
+python -m stockbot.cli universe
+```
+
+To widen analysis, raise `MAX_DYNAMIC_SYMBOLS` — and expect training time and
+API usage to rise with it.
+
+**Training is budgeted per cycle.** Each analysed symbol needs its own model,
+and building one means three candidate families through walk-forward validation.
+A cycle trains at most `MAX_TRAININGS_PER_CYCLE` (default 5) models, so a
+freshly widened universe fills in over several cycles instead of overrunning the
+ten-minute window and starving the scheduler. Until a symbol has a validated
+model it reports `INSUFFICIENT_EVIDENCE` — which is the honest answer, not a
+placeholder.
+
+### News features
+
+Nine features per bar, in `news_features.py`: article counts over 1h / 24h / 7d,
+a burst ratio against the symbol's own 7-day baseline, minutes since the last
+article, keyword tone over 1h and 24h, a `has_news_24h` indicator, and
+market-wide news intensity as a regime signal.
+
+**`news_*` "tone" is not sentiment analysis.** It counts words from two
+hand-written finance word lists and normalises the difference. There is no
+negation handling ("beats lowered expectations" scores positive) and it was
+never validated against labelled data. It is included because a transparent
+crude feature is preferable to an opaque one, and the models are free to ignore
+it. Do not read a tone number as a judgement about a company.
+
+When the news store is empty the news features come back NaN and are dropped
+automatically, so the application works identically with `NEWS_ENABLED=false`.
+A symbol that simply *has* no news gets zeros rather than NaN — otherwise those
+bars would be dropped from training, silently restricting the model to
+news-bearing bars.
 
 ### Prediction horizon
 
@@ -97,6 +175,13 @@ Financial time series are never shuffled. Specifically:
    Alpaca's calendar.
 5. **Unresolved rows dropped.** The final `PREDICTION_HORIZON_BARS` rows have no
    observable outcome and are removed, never imputed.
+6. **News windows end at the bar's close.** A news feature on the bar starting
+   at *t* may only use articles published at or before `t + bar_minutes`, the
+   earliest moment that bar could be acted on. Windows are measured backwards
+   from that point, never from "now" or from the end of the series. Only
+   `created_at` is read; `updated_at` is deliberately never used, because a
+   story revised hours later would inject future information into a past bar —
+   there is an AST-level test asserting the feature code never touches it.
 
 ### Model selection
 
@@ -178,7 +263,10 @@ reporting a bare 401.
 
 ```bash
 ./scripts/bootstrap_data.sh
-# or: python -m stockbot.cli backfill && python -m stockbot.cli train --force
+# or, step by step:
+python -m stockbot.cli news --backfill    # market-wide news, all US symbols
+python -m stockbot.cli backfill           # 10-minute bars
+python -m stockbot.cli train --force      # walk-forward validate and select
 ```
 
 ---
@@ -200,6 +288,10 @@ positions, pending orders, paper performance, backtest results, prediction and
 order history, last and next scheduled update, scheduler status, and the
 emergency stop.
 
+The **News** section carries the market-wide feed with its symbol tags, the most
+covered symbols in the lookback window, ingest-run history, and the coverage tab
+that states plainly which news-active symbols are not being analysed and why.
+
 The dashboard caches settings as a Streamlit resource, so restart it after
 editing `.env`.
 
@@ -220,6 +312,9 @@ market hours the run is recorded as `SKIPPED`, which keeps the dashboard's
 ### Other commands
 
 ```bash
+python -m stockbot.cli news                   # incremental market-wide news
+python -m stockbot.cli news --backfill        # full trailing window
+python -m stockbot.cli universe               # news vs analysis coverage
 python -m stockbot.cli cycle --force          # one cycle, even when closed (no orders)
 python -m stockbot.cli status                 # JSON state dump
 python -m stockbot.cli kill-switch engage     # emergency stop
@@ -356,15 +451,20 @@ dashboard treats a heartbeat older than an hour as dead.
 - **Watch the Errors tab** (or `python -m stockbot.cli status`). Data-validation
   failures and rejected orders land there.
 - **Log rotation** is built in: 10 MB per file, 5 files, JSON lines.
-- **Disk growth** is dominated by `bars` and `positions`; a single-symbol year of
-  10-minute bars is roughly 1 MB.
+- **Disk growth** is dominated by `bars`, `news_articles` and `positions`. A
+  single-symbol year of 10-minute bars is roughly 1 MB; market-wide news runs to
+  a few thousand articles a day, so keep `NEWS_INCLUDE_CONTENT=false` unless you
+  need article bodies.
+- **Watch for truncated news windows.** If `news_ingest_runs.truncated` is
+  persistently 1, ingestion is behind the feed: raise `NEWS_MAX_PAGES` or shorten
+  the interval. The dashboard warns about this.
 
 ---
 
 ## Tests
 
 ```bash
-python -m pytest              # 211 tests
+python -m pytest              # 268 tests
 python -m pytest --cov=stockbot --cov-report=term-missing
 ```
 
@@ -377,6 +477,13 @@ non-`true` value of `ALPACA_PAPER`; that `url_override` is never passed and a
 live endpoint raises; feature look-ahead; per-fold preprocessing; split ordering
 and the embargo; every one of the 15 risk rules; order rejection, cancellation
 and partial fills; and a headless render of the Streamlit app via `AppTest`.
+
+On the news side it asserts that the request carries **no symbol filter**, that
+off-watchlist symbols reach the store, that an article published after a bar
+closes is invisible to that bar, that removing future articles leaves earlier
+features bit-identical, that `updated_at` is never read (checked at the AST
+level, so the docstring explaining the rule does not satisfy it), and that an
+untradable news ticker is rejected with a recorded reason.
 
 ---
 

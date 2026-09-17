@@ -2,6 +2,8 @@
 
     python -m stockbot.cli check        read-only Alpaca paper connection test
     python -m stockbot.cli backfill     download history into SQLite
+    python -m stockbot.cli news         ingest market-wide news (all US symbols)
+    python -m stockbot.cli universe     show news vs analysis coverage
     python -m stockbot.cli train        walk-forward validate and select models
     python -m stockbot.cli cycle        run one analysis cycle
     python -m stockbot.cli run          start the scheduler (long-running)
@@ -61,6 +63,44 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_news(args: argparse.Namespace) -> int:
+    """Ingest the market-wide news feed. Not limited to the watchlist."""
+    settings, logger, db = _bootstrap("news")
+    client = AlpacaClient(settings)
+    engine = TradingEngine(settings, client, db)
+    result = (
+        engine.news.backfill(days=args.days) if args.backfill else engine.news.update()
+    )
+    result["coverage"] = engine.news.coverage()
+    logger.info("News command finished", extra={"status": result.get("status")})
+    _emit(result)
+    return 0 if result.get("status") in {"OK", "DISABLED"} else 1
+
+
+def cmd_universe(args: argparse.Namespace) -> int:
+    """Show which symbols news covers versus which are actually analysed."""
+    settings, _logger, db = _bootstrap("universe")
+    client = AlpacaClient(settings)
+    engine = TradingEngine(settings, client, db)
+    if args.refresh_assets:
+        engine.universe.refresh_assets(force=True)
+    built = engine.universe.build(persist=False)
+    _emit(
+        {
+            "news_coverage": engine.news.coverage(),
+            "analysis_universe": built.as_dict(),
+            "coverage_report": engine.universe.coverage_report(),
+            "note": (
+                "News collection is market-wide. Analysis is capped at "
+                f"{settings.max_dynamic_symbols} news-driven symbols plus the "
+                "configured watchlist, because each analysed symbol needs its own "
+                "validated model."
+            ),
+        }
+    )
+    return 0
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     settings, logger, db = _bootstrap("train")
     client = AlpacaClient(settings)
@@ -101,6 +141,8 @@ def cmd_status(_args: argparse.Namespace) -> int:
         "recent_orders": db.recent_orders(limit=10),
         "recent_errors": db.recent_errors(limit=10),
         "kill_switch": bool(db.get_state("kill_switch", False)),
+        "news_coverage": db.news_coverage(),
+        "analysis_universe": [row["symbol"] for row in db.latest_universe()],
     }
     _emit(payload)
     return 0
@@ -133,6 +175,15 @@ def build_parser() -> argparse.ArgumentParser:
     backfill = sub.add_parser("backfill", help="download bar history into SQLite")
     backfill.add_argument("--days", type=int, default=None)
     backfill.set_defaults(func=cmd_backfill)
+
+    news = sub.add_parser("news", help="ingest market-wide news (all US symbols)")
+    news.add_argument("--backfill", action="store_true", help="fetch a full trailing window")
+    news.add_argument("--days", type=int, default=None)
+    news.set_defaults(func=cmd_news)
+
+    universe = sub.add_parser("universe", help="show news vs analysis coverage")
+    universe.add_argument("--refresh-assets", action="store_true")
+    universe.set_defaults(func=cmd_universe)
 
     train = sub.add_parser("train", help="walk-forward validate and select models")
     train.add_argument("--force", action="store_true", help="retrain even if a model is current")

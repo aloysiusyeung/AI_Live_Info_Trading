@@ -190,6 +190,76 @@ CREATE TABLE IF NOT EXISTS scheduler_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_sched_time ON scheduler_runs(started_at);
 
+-- News is stored market-wide: every article Alpaca returns is kept, whatever
+-- symbols it mentions. There is deliberately no watchlist filter here.
+CREATE TABLE IF NOT EXISTS news_articles (
+    id                  INTEGER PRIMARY KEY,        -- Alpaca/Benzinga article id
+    created_at          TEXT NOT NULL,              -- when the story was published
+    updated_at          TEXT,
+    headline            TEXT NOT NULL,
+    summary             TEXT,
+    author              TEXT,
+    source              TEXT,
+    url                 TEXT,
+    content             TEXT,
+    symbol_count        INTEGER NOT NULL DEFAULT 0,
+    polarity            REAL,                       -- crude lexicon score, see news_features
+    ingested_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_news_created ON news_articles(created_at);
+
+-- Many-to-many: one article can tag many symbols, and most do.
+CREATE TABLE IF NOT EXISTS news_article_symbols (
+    article_id          INTEGER NOT NULL,
+    symbol              TEXT NOT NULL,
+    created_at          TEXT NOT NULL,              -- denormalised for fast as-of queries
+    PRIMARY KEY (article_id, symbol),
+    FOREIGN KEY (article_id) REFERENCES news_articles(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_news_symbol_time ON news_article_symbols(symbol, created_at);
+
+CREATE TABLE IF NOT EXISTS news_ingest_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at          TEXT NOT NULL,
+    finished_at         TEXT,
+    status              TEXT NOT NULL,
+    window_start        TEXT,
+    window_end          TEXT,
+    pages_fetched       INTEGER DEFAULT 0,
+    articles_seen       INTEGER DEFAULT 0,
+    articles_stored     INTEGER DEFAULT 0,
+    symbols_seen        INTEGER DEFAULT 0,
+    truncated           INTEGER DEFAULT 0,          -- 1 when the page cap was hit
+    detail              TEXT
+);
+
+-- The tradable US equity universe, refreshed from Alpaca's assets endpoint.
+CREATE TABLE IF NOT EXISTS assets (
+    symbol              TEXT PRIMARY KEY,
+    name                TEXT,
+    exchange            TEXT,
+    asset_class         TEXT,
+    status              TEXT,
+    tradable            INTEGER NOT NULL DEFAULT 0,
+    shortable           INTEGER NOT NULL DEFAULT 0,
+    fractionable        INTEGER NOT NULL DEFAULT 0,
+    refreshed_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assets_tradable ON assets(tradable, exchange);
+
+-- Snapshot of which symbols the analysis universe covered, and why.
+CREATE TABLE IF NOT EXISTS universe_snapshots (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_at         TEXT NOT NULL,
+    symbol              TEXT NOT NULL,
+    source              TEXT NOT NULL,              -- core | news
+    news_count          INTEGER DEFAULT 0,
+    rank                INTEGER,
+    admitted            INTEGER NOT NULL DEFAULT 1,
+    reason              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_universe_time ON universe_snapshots(snapshot_at);
+
 CREATE TABLE IF NOT EXISTS app_state (
     key                 TEXT PRIMARY KEY,
     value               TEXT NOT NULL,
@@ -533,6 +603,211 @@ class Database:
     def recent_scheduler_runs(self, limit: int = 20) -> list[dict]:
         return self.query(
             "SELECT * FROM scheduler_runs ORDER BY started_at DESC LIMIT ?", (limit,)
+        )
+
+    # -- news (market-wide) ----------------------------------------------
+    def upsert_news(self, articles: Iterable[dict]) -> int:
+        """Store articles idempotently, keyed by Alpaca's article id.
+
+        Re-ingesting an overlapping window is therefore free, and a revised
+        story replaces its earlier copy rather than duplicating it.
+        """
+        articles = list(articles)
+        if not articles:
+            return 0
+        stamp = utc_now_iso()
+        rows = [
+            (
+                int(a["id"]), _to_iso(a["created_at"]),
+                _to_iso(a["updated_at"]) if a.get("updated_at") else None,
+                a["headline"], a.get("summary"), a.get("author"), a.get("source"),
+                a.get("url"), a.get("content"), len(a.get("symbols") or []),
+                a.get("polarity"), stamp,
+            )
+            for a in articles
+        ]
+        self.executemany(
+            """INSERT INTO news_articles
+               (id, created_at, updated_at, headline, summary, author, source, url,
+                content, symbol_count, polarity, ingested_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                 updated_at=excluded.updated_at, headline=excluded.headline,
+                 summary=excluded.summary, source=excluded.source,
+                 content=excluded.content, symbol_count=excluded.symbol_count,
+                 polarity=excluded.polarity, ingested_at=excluded.ingested_at""",
+            rows,
+        )
+        links = [
+            (int(a["id"]), symbol.upper(), _to_iso(a["created_at"]))
+            for a in articles
+            for symbol in (a.get("symbols") or [])
+        ]
+        self.executemany(
+            """INSERT INTO news_article_symbols (article_id, symbol, created_at)
+               VALUES (?,?,?)
+               ON CONFLICT(article_id, symbol) DO UPDATE SET
+                 created_at=excluded.created_at""",
+            links,
+        )
+        return len(rows)
+
+    def news_for_symbol(self, symbol: str, limit: int = 50) -> list[dict]:
+        return self.query(
+            """SELECT a.* FROM news_articles a
+               JOIN news_article_symbols s ON s.article_id = a.id
+               WHERE s.symbol = ?
+               ORDER BY a.created_at DESC LIMIT ?""",
+            (symbol.upper(), limit),
+        )
+
+    def latest_news(self, limit: int = 100) -> list[dict]:
+        """Most recent articles across the whole market."""
+        return self.query(
+            "SELECT * FROM news_articles ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+
+    def news_symbol_rows(self, since_iso: str | None = None) -> list[dict]:
+        """Raw (symbol, created_at) pairs, used to build as-of news features."""
+        if since_iso:
+            return self.query(
+                "SELECT symbol, created_at, article_id FROM news_article_symbols "
+                "WHERE created_at >= ? ORDER BY created_at ASC",
+                (since_iso,),
+            )
+        return self.query(
+            "SELECT symbol, created_at, article_id FROM news_article_symbols "
+            "ORDER BY created_at ASC"
+        )
+
+    def news_counts_by_symbol(self, since_iso: str) -> list[dict]:
+        """Article counts per symbol since a timestamp, most active first."""
+        return self.query(
+            """SELECT s.symbol, COUNT(DISTINCT s.article_id) AS news_count,
+                      MAX(s.created_at) AS latest_at
+               FROM news_article_symbols s
+               WHERE s.created_at >= ?
+               GROUP BY s.symbol
+               ORDER BY news_count DESC, latest_at DESC""",
+            (since_iso,),
+        )
+
+    def news_coverage(self) -> dict:
+        """Coverage stats that answer 'is this really market-wide?'."""
+        totals = self.query_one(
+            "SELECT COUNT(*) AS articles, MIN(created_at) AS first_at, "
+            "MAX(created_at) AS last_at FROM news_articles"
+        ) or {}
+        symbols = self.query_one(
+            "SELECT COUNT(DISTINCT symbol) AS symbols FROM news_article_symbols"
+        ) or {}
+        links = self.query_one(
+            "SELECT COUNT(*) AS links FROM news_article_symbols"
+        ) or {}
+        return {
+            "articles": totals.get("articles", 0),
+            "distinct_symbols": symbols.get("symbols", 0),
+            "article_symbol_links": links.get("links", 0),
+            "first_article_at": totals.get("first_at"),
+            "last_article_at": totals.get("last_at"),
+        }
+
+    def latest_news_created_at(self) -> str | None:
+        row = self.query_one("SELECT MAX(created_at) AS m FROM news_articles")
+        return row["m"] if row and row["m"] else None
+
+    def start_news_run(self, window_start: str | None, window_end: str | None) -> int:
+        return self.insert(
+            """INSERT INTO news_ingest_runs
+               (started_at, status, window_start, window_end) VALUES (?,?,?,?)""",
+            (utc_now_iso(), "RUNNING", window_start, window_end),
+        )
+
+    def finish_news_run(self, run_id: int, status: str, **kw: Any) -> None:
+        self.execute(
+            """UPDATE news_ingest_runs SET finished_at=?, status=?, pages_fetched=?,
+                   articles_seen=?, articles_stored=?, symbols_seen=?, truncated=?,
+                   detail=?
+               WHERE id=?""",
+            (
+                utc_now_iso(), status, kw.get("pages_fetched", 0),
+                kw.get("articles_seen", 0), kw.get("articles_stored", 0),
+                kw.get("symbols_seen", 0), 1 if kw.get("truncated") else 0,
+                json.dumps(kw.get("detail"), default=str) if kw.get("detail") else None,
+                run_id,
+            ),
+        )
+
+    def recent_news_runs(self, limit: int = 20) -> list[dict]:
+        return self.query(
+            "SELECT * FROM news_ingest_runs ORDER BY started_at DESC LIMIT ?", (limit,)
+        )
+
+    # -- assets / universe -------------------------------------------------
+    def upsert_assets(self, assets: Iterable[dict]) -> int:
+        stamp = utc_now_iso()
+        return self.executemany(
+            """INSERT INTO assets
+               (symbol, name, exchange, asset_class, status, tradable, shortable,
+                fractionable, refreshed_at)
+               VALUES (?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(symbol) DO UPDATE SET
+                 name=excluded.name, exchange=excluded.exchange,
+                 asset_class=excluded.asset_class, status=excluded.status,
+                 tradable=excluded.tradable, shortable=excluded.shortable,
+                 fractionable=excluded.fractionable,
+                 refreshed_at=excluded.refreshed_at""",
+            [
+                (
+                    a["symbol"].upper(), a.get("name"), a.get("exchange"),
+                    a.get("asset_class"), a.get("status"),
+                    1 if a.get("tradable") else 0, 1 if a.get("shortable") else 0,
+                    1 if a.get("fractionable") else 0, stamp,
+                )
+                for a in assets
+            ],
+        )
+
+    def tradable_symbols(self) -> set[str]:
+        return {
+            row["symbol"]
+            for row in self.query("SELECT symbol FROM assets WHERE tradable=1")
+        }
+
+    def asset_count(self) -> dict:
+        row = self.query_one(
+            "SELECT COUNT(*) AS total, SUM(tradable) AS tradable, "
+            "MAX(refreshed_at) AS refreshed_at FROM assets"
+        ) or {}
+        return {
+            "total": row.get("total", 0) or 0,
+            "tradable": row.get("tradable", 0) or 0,
+            "refreshed_at": row.get("refreshed_at"),
+        }
+
+    def save_universe_snapshot(self, entries: Iterable[dict]) -> int:
+        stamp = utc_now_iso()
+        return self.executemany(
+            """INSERT INTO universe_snapshots
+               (snapshot_at, symbol, source, news_count, rank, admitted, reason)
+               VALUES (?,?,?,?,?,?,?)""",
+            [
+                (
+                    stamp, e["symbol"], e["source"], e.get("news_count", 0),
+                    e.get("rank"), 1 if e.get("admitted", True) else 0, e.get("reason"),
+                )
+                for e in entries
+            ],
+        )
+
+    def latest_universe(self) -> list[dict]:
+        row = self.query_one("SELECT MAX(snapshot_at) AS mx FROM universe_snapshots")
+        if not row or not row["mx"]:
+            return []
+        return self.query(
+            "SELECT * FROM universe_snapshots WHERE snapshot_at=? "
+            "ORDER BY source, rank, symbol",
+            (row["mx"],),
         )
 
     # -- app state (kill switch etc.) ------------------------------------

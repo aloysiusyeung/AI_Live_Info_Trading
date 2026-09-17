@@ -81,11 +81,27 @@ def test_no_orders_while_disabled_even_on_a_buy(wired):
     assert client.submitted == []
 
 
-def test_no_model_yields_insufficient_evidence(wired):
-    _settings, db, _client, engine = wired
+def test_no_model_yields_insufficient_evidence(wired, monkeypatch):
+    """A symbol with no validated model must not produce a directional signal."""
+    settings, db, _client, engine = wired
+    # The cycle self-provisions models, so deny it any training budget to
+    # reproduce the "no model yet" state a freshly admitted symbol is in.
+    monkeypatch.setattr(settings, "max_trainings_per_cycle", 0)
     engine.collector.backfill()
-    result = engine.run_cycle()   # no training step
+    result = engine.run_cycle()
     assert result.outcomes[0].signal.signal == INSUFFICIENT_EVIDENCE
+    assert result.training["AAPL"]["status"] == "deferred"
+
+
+def test_training_budget_limits_work_per_cycle(wired, monkeypatch):
+    """A freshly widened universe must not overrun the cycle training models."""
+    settings, db, _client, engine = wired
+    monkeypatch.setattr(settings, "watchlist", ["AAPL", "TSLA"])
+    monkeypatch.setattr(settings, "max_trainings_per_cycle", 1)
+    engine.collector.backfill()
+    report = engine.ensure_models(symbols=["AAPL", "TSLA"], budget=1)
+    statuses = [r["status"] for r in report.values()]
+    assert statuses.count("deferred") == 1
 
 
 def test_stale_data_yields_insufficient_evidence(tmp_settings, db, monkeypatch):

@@ -33,6 +33,26 @@ def _clean_env(monkeypatch):
     monkeypatch.setenv("ENABLE_PAPER_ORDERS", "false")
 
 
+@pytest.fixture(autouse=True)
+def _reset_logging():
+    """Detach log handlers after each test.
+
+    ``setup_logging`` attaches a stderr handler to the root logger. Without
+    this, a later test logging through it writes to a capture stream pytest has
+    already closed, producing "I/O operation on closed file" noise.
+    """
+    import logging
+
+    yield
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:  # noqa: BLE001 - teardown must not fail a test
+            pass
+
+
 @pytest.fixture
 def tmp_settings(tmp_path, monkeypatch):
     from stockbot.config import load_settings
@@ -123,3 +143,33 @@ def bars():
 @pytest.fixture
 def benchmark_bars():
     return synthetic_bars(symbol="SPY", seed=29, start_price=450.0)
+
+
+def synthetic_news(
+    specs: list[tuple[str, int, str]],
+    base: datetime | None = None,
+) -> list[dict]:
+    """SYNTHETIC news articles for testing code paths only.
+
+    ``specs`` is a list of ``(symbol_csv, minutes_offset, headline)``. These are
+    invented strings; they are not real headlines and must never be presented as
+    market information.
+    """
+    base = base or datetime.now(timezone.utc)
+    articles = []
+    for i, (symbols, offset, headline) in enumerate(specs, start=1):
+        articles.append(
+            {
+                "id": 1000 + i,
+                "headline": headline,
+                "summary": f"Synthetic summary for {symbols}.",
+                "author": "test-fixture",
+                "source": "synthetic",
+                "url": f"https://example.invalid/{1000 + i}",
+                "content": None,
+                "created_at": base + timedelta(minutes=offset),
+                "updated_at": base + timedelta(minutes=offset),
+                "symbols": [s.strip().upper() for s in symbols.split(",") if s.strip()],
+            }
+        )
+    return articles

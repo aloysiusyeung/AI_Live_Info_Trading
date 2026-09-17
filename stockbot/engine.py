@@ -21,12 +21,15 @@ import pandas as pd
 from .alpaca_client import AlpacaClient, AlpacaError
 from .config import Settings
 from .data.collector import BarCollector
+from .data.news_collector import NewsCollector
 from .db import Database
 from .features import build_features, latest_feature_row
 from .models.trainer import ModelTrainer
+from .news_features import NewsIndex
 from .orders import OrderResult, PaperOrderManager
 from .risk import RiskContext, RiskDecision, RiskEngine
 from .signals import Signal, SignalGenerator
+from .universe import UniverseManager
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,9 @@ class CycleResult:
     market_open: bool = False
     outcomes: list[SymbolOutcome] = field(default_factory=list)
     orders_submitted: int = 0
+    news: dict[str, Any] = field(default_factory=dict)
+    universe: dict[str, Any] = field(default_factory=dict)
+    training: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +65,9 @@ class CycleResult:
             "reason": self.reason,
             "market_open": self.market_open,
             "orders_submitted": self.orders_submitted,
+            "news": self.news,
+            "universe": self.universe,
+            "training": self.training,
             "symbols": [
                 {
                     "symbol": o.symbol,
@@ -80,6 +89,8 @@ class TradingEngine:
         self.client = client
         self.db = db
         self.collector = BarCollector(settings, client, db)
+        self.news = NewsCollector(settings, client, db)
+        self.universe = UniverseManager(settings, client, db)
         self.trainer = ModelTrainer(settings, db)
         self.signals = SignalGenerator(settings)
         self.risk = RiskEngine(settings, db)
@@ -87,24 +98,46 @@ class TradingEngine:
         self._model_cache: dict[str, dict] = {}
         self._session_minutes: dict = {}
         self._session_minutes_fetched: datetime | None = None
+        self._news_index: NewsIndex | None = None
 
     # -- model lifecycle ----------------------------------------------------
-    def ensure_models(self, force: bool = False) -> dict[str, Any]:
-        """Train any symbol that has no current model. Returns a per-symbol report."""
+    def ensure_models(
+        self,
+        force: bool = False,
+        symbols: list[str] | None = None,
+        budget: int | None = None,
+    ) -> dict[str, Any]:
+        """Train any symbol that has no current model.
+
+        ``budget`` caps how many models this call may train. When the budget is
+        spent the remaining symbols are reported as ``deferred`` and pick up on
+        a later call — they emit INSUFFICIENT_EVIDENCE until then, which is the
+        honest outcome for a symbol with no validated model.
+        """
         report: dict[str, Any] = {}
         benchmark = self.collector.load_frame(self.settings.benchmark_symbol)
-        for symbol in self.settings.watchlist:
+        targets = symbols if symbols is not None else self.settings.watchlist
+        trained = 0
+        for symbol in targets:
             existing = self.db.selected_model(symbol)
             if existing and not force and not self._model_is_stale(existing):
                 report[symbol] = {"status": "current", "model": existing["model_name"]}
+                continue
+            if budget is not None and trained >= budget:
+                report[symbol] = {
+                    "status": "deferred",
+                    "reason": f"training budget of {budget} spent this cycle",
+                }
                 continue
             bars, validation = self.collector.load_validated(symbol)
             if bars.empty:
                 report[symbol] = {"status": "skipped", "reason": "no validated bars"}
                 continue
             outcome = self.trainer.train_symbol(
-                symbol, bars, benchmark, session_minutes=self.session_minutes()
+                symbol, bars, benchmark, session_minutes=self.session_minutes(),
+                news_index=self.news_index(refresh=False),
             )
+            trained += 1
             self._model_cache.pop(symbol, None)
             report[symbol] = {
                 "status": "trained" if outcome.selected_model else "no_model",
@@ -139,6 +172,22 @@ class TradingEngine:
                            extra={"error": str(exc)})
             self.db.log_error("engine", f"calendar unavailable: {exc}", severity="WARNING")
         return self._session_minutes
+
+    def news_index(self, refresh: bool = True) -> NewsIndex | None:
+        """Market-wide news index for as-of feature computation."""
+        if not self.settings.news_enabled:
+            return None
+        if refresh or self._news_index is None:
+            since = datetime.now(timezone.utc) - timedelta(
+                days=self.settings.news_backfill_days + 1
+            )
+            try:
+                self._news_index = NewsIndex.from_db(self.db, since=since)
+            except Exception as exc:  # noqa: BLE001 - features degrade, cycle continues
+                logger.warning("News index build failed", extra={"error": str(exc)})
+                self.db.log_error("news", f"index build failed: {exc}", severity="WARNING")
+                return self._news_index
+        return self._news_index
 
     def _model_is_stale(self, record: dict) -> bool:
         try:
@@ -192,11 +241,42 @@ class TradingEngine:
             logger.info("Market closed; cycle skipped", extra={"next_open": str(next_open)})
             return result
 
+        # News first: it is market-wide and feeds both the features and the
+        # dynamic universe, so it must land before either is built.
+        if self.settings.news_enabled:
+            try:
+                result.news = self.news.update()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("News update failed")
+                self.db.log_error("engine", f"news update failed: {exc}", severity="WARNING")
+                result.news = {"status": "ERROR", "error": str(exc)}
+
         try:
-            self.collector.update()
+            self.universe.refresh_assets()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Asset refresh failed", extra={"error": str(exc)})
+
+        universe = self.universe.build()
+        result.universe = universe.as_dict()
+        symbols = universe.symbols
+
+        try:
+            self.collector.update(symbols=[*symbols, self.settings.benchmark_symbol])
         except Exception as exc:  # noqa: BLE001
             logger.exception("Bar update failed")
             self.db.log_error("engine", f"bar update failed: {exc}")
+
+        # Any newly admitted symbol needs a validated model before it can
+        # produce anything other than INSUFFICIENT_EVIDENCE.
+        try:
+            result.training = self.ensure_models(
+                symbols=symbols, budget=self.settings.max_trainings_per_cycle
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Model provisioning failed")
+            self.db.log_error("engine", f"ensure_models failed: {exc}", severity="WARNING")
+
+        self.news_index(refresh=True)
 
         # Shared context fetched once per cycle.
         try:
@@ -216,7 +296,7 @@ class TradingEngine:
         positions = {p["symbol"]: p for p in positions_list}
 
         try:
-            quotes = self.client.get_latest_quotes(self.settings.watchlist)
+            quotes = self.client.get_latest_quotes(symbols)
         except AlpacaError as exc:
             logger.warning("Quote fetch failed", extra={"error": str(exc)})
             quotes = {}
@@ -224,7 +304,7 @@ class TradingEngine:
         benchmark = self.collector.load_frame(self.settings.benchmark_symbol)
         signals_generated = 0
 
-        for symbol in self.settings.watchlist:
+        for symbol in symbols:
             outcome = self._process_symbol(
                 symbol,
                 benchmark=benchmark,
@@ -285,6 +365,9 @@ class TradingEngine:
             featured = build_features(
                 bars, benchmark, tz=self.settings.timezone,
                 session_minutes=self.session_minutes(),
+                news_index=self.news_index(refresh=False),
+                bar_minutes=self.settings.bar_minutes,
+                symbol=symbol,
             )
             bundle = self._get_model(symbol)
             if bundle is None:

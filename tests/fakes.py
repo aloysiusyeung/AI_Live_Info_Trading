@@ -20,11 +20,16 @@ class FakeAlpacaClient:
         bars: dict[str, list[dict]] | None = None,
         market_open: bool = True,
         equity: float = 100_000.0,
+        news: list[dict] | None = None,
+        assets: list[dict] | None = None,
     ) -> None:
         from zoneinfo import ZoneInfo
 
         self.settings = settings
         self.tz = ZoneInfo(settings.timezone)
+        self._news = list(news or [])
+        self._assets = assets
+        self.news_calls: list[dict] = []
         self._bars = bars or {}
         self.market_open = market_open
         self.equity = equity
@@ -110,6 +115,40 @@ class FakeAlpacaClient:
                 days.append({"date": cursor, "open": time(9, 30), "close": time(16, 0)})
             cursor += timedelta(days=1)
         return days
+
+    # -- news (market-wide) ------------------------------------------------
+    def get_news(self, start, end=None, symbols=None, max_articles=2000,
+                 sort="asc", include_content=False, exclude_contentless=False):
+        """Mirror the real client: no symbols filter means market-wide."""
+        self.news_calls.append({
+            "start": start, "end": end, "symbols": symbols,
+            "max_articles": max_articles,
+        })
+        selected = [
+            a for a in self._news
+            if a["created_at"] >= start and (end is None or a["created_at"] <= end)
+        ]
+        if symbols:
+            wanted = {s.upper() for s in symbols}
+            selected = [a for a in selected if wanted & set(a["symbols"])]
+        selected.sort(key=lambda a: a["created_at"], reverse=(sort == "desc"))
+        truncated = len(selected) > max_articles
+        return selected[:max_articles], truncated
+
+    def get_us_equities(self, active_only: bool = True) -> list[dict]:
+        if self._assets is not None:
+            return list(self._assets)
+        # Default: every symbol appearing in the fake news feed is tradable.
+        symbols = sorted({s for a in self._news for s in a["symbols"]})
+        symbols = sorted(set(symbols) | set(self.settings.all_symbols))
+        return [
+            {
+                "symbol": s, "name": f"{s} Inc", "exchange": "NASDAQ",
+                "asset_class": "us_equity", "status": "active",
+                "tradable": True, "shortable": True, "fractionable": True,
+            }
+            for s in symbols
+        ]
 
     def session_minutes_map(self, start, end) -> dict:
         return {day["date"]: 390.0 for day in self.get_calendar(start, end)}

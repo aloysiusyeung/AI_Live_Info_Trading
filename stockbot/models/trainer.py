@@ -87,10 +87,13 @@ class ModelTrainer:
         bars: pd.DataFrame,
         benchmark: pd.DataFrame | None,
         session_minutes: dict | None = None,
+        news_index=None,
+        symbol: str | None = None,
     ) -> tuple[pd.DataFrame, list[str], pd.DataFrame]:
         """Return (supervised frame, usable feature names, featured frame)."""
         featured = build_features(
-            bars, benchmark, tz=self.settings.timezone, session_minutes=session_minutes
+            bars, benchmark, tz=self.settings.timezone, session_minutes=session_minutes,
+            news_index=news_index, bar_minutes=self.settings.bar_minutes, symbol=symbol,
         )
         featured, usable = prepare_training_frame(featured, FEATURE_COLUMNS)
         supervised = build_supervised_frame(
@@ -110,9 +113,12 @@ class ModelTrainer:
         benchmark: pd.DataFrame | None = None,
         persist: bool = True,
         session_minutes: dict | None = None,
+        news_index=None,
     ) -> TrainingOutcome:
         outcome = TrainingOutcome(symbol=symbol, trained_at=datetime.now(timezone.utc))
-        supervised, usable, featured = self.build_supervised(bars, benchmark, session_minutes)
+        supervised, usable, featured = self.build_supervised(
+            bars, benchmark, session_minutes, news_index=news_index, symbol=symbol
+        )
         outcome.feature_names = usable
         outcome.n_rows = len(supervised)
 

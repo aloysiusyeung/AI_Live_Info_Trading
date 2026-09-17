@@ -15,7 +15,9 @@ from typing import Any, Iterable, Sequence
 from zoneinfo import ZoneInfo
 
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.news import NewsClient
 from alpaca.data.requests import (
+    NewsRequest,
     StockBarsRequest,
     StockLatestQuoteRequest,
     StockSnapshotRequest,
@@ -23,7 +25,9 @@ from alpaca.data.requests import (
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import AssetClass, AssetStatus
 from alpaca.trading.requests import (
+    GetAssetsRequest,
     GetCalendarRequest,
     GetOrdersRequest,
     MarketOrderRequest,
@@ -63,6 +67,7 @@ class AlpacaClient:
         # paper=True is hard-coded, not read from a variable a caller could flip.
         self.trading = TradingClient(api_key=api_key, secret_key=secret_key, paper=True)
         self.data = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
+        self.news = NewsClient(api_key=api_key, secret_key=secret_key)
         self._assert_paper_endpoint()
 
     # -- safety ----------------------------------------------------------
@@ -352,6 +357,98 @@ class AlpacaClient:
             }
         return out
 
+    # -- news (market-wide) -----------------------------------------------
+    def get_news(
+        self,
+        start: datetime,
+        end: datetime | None = None,
+        symbols: Iterable[str] | None = None,
+        max_articles: int = 2000,
+        sort: str = "asc",
+        include_content: bool = False,
+        exclude_contentless: bool = False,
+    ) -> tuple[list[dict], bool]:
+        """Fetch news articles, **market-wide by default**.
+
+        Leaving ``symbols`` as ``None`` omits the symbol filter from the
+        request, so Alpaca returns every article for every US symbol it covers,
+        each tagged with the symbols it mentions. Passing ``symbols`` narrows
+        it, which is only used for targeted backfills.
+
+        ``alpaca-py`` paginates internally and stops only when the feed is
+        exhausted or ``limit`` is reached, and it does not hand back a usable
+        page token. So ``max_articles`` is a hard cap — without one, a wide
+        window would pull the entire feed in a single unbounded call.
+
+        Returns ``(articles, truncated)``. ``truncated`` means the cap was hit
+        and more articles exist in the window, so callers record the window as
+        incomplete instead of assuming full coverage. With the default
+        ascending sort, the caller's watermark advances and the next run
+        resumes where this one stopped.
+        """
+        if max_articles < 1:
+            return [], False
+
+        request = NewsRequest(
+            start=start,
+            end=end,
+            symbols=",".join(s.upper() for s in symbols) if symbols else None,
+            limit=max_articles,
+            sort=sort,
+            include_content=include_content,
+            exclude_contentless=exclude_contentless,
+        )
+        try:
+            response = self.news.get_news(request)
+        except Exception as exc:  # noqa: BLE001
+            raise AlpacaError(f"get_news failed: {exc}") from exc
+
+        raw = getattr(response, "data", response) or {}
+        batch = raw.get("news", []) if isinstance(raw, dict) else []
+        articles = [self._news_to_dict(item) for item in batch]
+        return articles, len(articles) >= max_articles
+
+    @staticmethod
+    def _news_to_dict(item: Any) -> dict:
+        symbols = [str(s).upper() for s in (getattr(item, "symbols", None) or [])]
+        return {
+            "id": int(getattr(item, "id", 0)),
+            "headline": getattr(item, "headline", "") or "",
+            "summary": getattr(item, "summary", None),
+            "author": getattr(item, "author", None),
+            "source": getattr(item, "source", None),
+            "url": getattr(item, "url", None),
+            "content": getattr(item, "content", None),
+            "created_at": _ensure_utc(getattr(item, "created_at", None)),
+            "updated_at": _ensure_utc(getattr(item, "updated_at", None)),
+            "symbols": symbols,
+        }
+
+    # -- assets (the tradable US equity universe) --------------------------
+    def get_us_equities(self, active_only: bool = True) -> list[dict]:
+        """Every US equity Alpaca lists, used to screen news-derived symbols."""
+        request = GetAssetsRequest(
+            asset_class=AssetClass.US_EQUITY,
+            status=AssetStatus.ACTIVE if active_only else None,
+        )
+        try:
+            assets = self.trading.get_all_assets(request)
+        except Exception as exc:  # noqa: BLE001
+            raise AlpacaError(f"get_all_assets failed: {exc}") from exc
+        return [
+            {
+                "symbol": str(a.symbol).upper(),
+                "name": getattr(a, "name", None),
+                "exchange": str(getattr(a, "exchange", "") or ""),
+                "asset_class": str(getattr(a, "asset_class", "") or ""),
+                "status": str(getattr(a, "status", "") or ""),
+                "tradable": bool(getattr(a, "tradable", False)),
+                "shortable": bool(getattr(a, "shortable", False)),
+                "fractionable": bool(getattr(a, "fractionable", False)),
+            }
+            for a in assets
+        ]
+
     # -- connection test --------------------------------------------------
     def credentials_look_like_placeholders(self) -> bool:
         """True when the configured keys are obviously not real Alpaca keys.
@@ -421,6 +518,30 @@ class AlpacaClient:
             }
         except AlpacaError as exc:
             report["checks"]["market_data"] = {"ok": False, "error": str(exc)}
+
+        try:
+            start = datetime.now(timezone.utc) - timedelta(days=2)
+            articles, truncated = self.get_news(start=start, max_articles=10)
+            symbols = {s for a in articles for s in a["symbols"]}
+            report["checks"]["news"] = {
+                "ok": True,
+                "articles": len(articles),
+                "distinct_symbols": len(symbols),
+                "scope": "market-wide (no symbol filter)",
+                "more_pages_available": truncated,
+            }
+        except AlpacaError as exc:
+            report["checks"]["news"] = {"ok": False, "error": str(exc)}
+
+        try:
+            equities = self.get_us_equities()
+            report["checks"]["assets"] = {
+                "ok": bool(equities),
+                "us_equities": len(equities),
+                "tradable": sum(1 for a in equities if a["tradable"]),
+            }
+        except AlpacaError as exc:
+            report["checks"]["assets"] = {"ok": False, "error": str(exc)}
 
         report["ok"] = all(c.get("ok") for c in report["checks"].values())
         if not report["ok"] and any(

@@ -59,6 +59,22 @@ def _run(timeout: float = 120):
     return harness
 
 
+def _all_text(harness) -> str:
+    """Every text element the page rendered.
+
+    Streamlit keeps markdown, captions, info/warning/error boxes and headers in
+    separate collections, so a single one of them is not "what the page says".
+    """
+    chunks: list[str] = []
+    for attr in ("markdown", "caption", "info", "warning", "error", "success",
+                 "header", "subheader", "title", "text"):
+        try:
+            chunks.extend(str(el.value) for el in getattr(harness, attr))
+        except (AttributeError, TypeError):
+            continue
+    return " ".join(chunks)
+
+
 def test_dashboard_renders_on_an_empty_database(app_env):
     harness = _run()
     assert not harness.exception
@@ -66,8 +82,7 @@ def test_dashboard_renders_on_an_empty_database(app_env):
 
 def test_paper_trading_label_is_shown(app_env):
     harness = _run()
-    text = " ".join(str(m.value) for m in harness.markdown)
-    assert "PAPER TRADING" in text
+    assert "PAPER TRADING" in _all_text(harness)
 
 
 def test_disconnected_broker_is_reported_not_faked(app_env):
@@ -126,8 +141,7 @@ def test_dashboard_renders_with_data(app_env, bars):
 
     harness = _run()
     assert not harness.exception
-    text = " ".join(str(m.value) for m in harness.markdown)
-    assert "AAPL" in text
+    assert "AAPL" in _all_text(harness)
 
 
 def test_kill_switch_state_is_reflected(app_env):
@@ -172,3 +186,69 @@ def test_performance_computed_from_snapshots(app_env):
     perf = da.paper_performance(db)
     assert perf["available"] is True
     assert perf["total_return"] == pytest.approx(0.01)
+
+
+# -- news views -------------------------------------------------------------
+def test_dashboard_renders_market_wide_news(app_env):
+    """News for symbols outside the watchlist must appear in the feed."""
+    from tests.conftest import synthetic_news
+
+    _settings, db = app_env
+    articles = synthetic_news(
+        [
+            ("AAPL", -20, "Apple beats estimates as profit surges"),
+            ("ZZZZ", -40, "Off-watchlist ticker makes headlines"),
+        ]
+    )
+    db.upsert_news(articles)
+    db.upsert_assets([{
+        "symbol": "AAPL", "name": "Apple", "exchange": "NASDAQ",
+        "asset_class": "us_equity", "status": "active",
+        "tradable": True, "shortable": True, "fractionable": True,
+    }])
+    db.save_universe_snapshot([
+        {"symbol": "AAPL", "source": "core", "reason": "configured_watchlist"},
+        {"symbol": "ZZZZ", "source": "news", "news_count": 1, "rank": 2,
+         "admitted": False, "reason": "not_tradable_on_alpaca"},
+    ])
+
+    harness = _run()
+    assert not harness.exception
+    assert "market-wide" in _all_text(harness).lower()
+
+
+def test_dashboard_warns_about_truncated_news_windows(app_env):
+    """Incomplete coverage must be surfaced, not hidden."""
+    from tests.conftest import synthetic_news
+
+    _settings, db = app_env
+    db.upsert_news(synthetic_news([("AAPL", -10, "Something happened")]))
+    run_id = db.start_news_run("2025-01-01T00:00:00+00:00", None)
+    db.finish_news_run(run_id, "OK", articles_stored=1, truncated=True)
+
+    harness = _run()
+    assert not harness.exception
+    assert "article cap" in _all_text(harness)
+
+
+def test_news_feed_tags_each_article_with_its_symbols(app_env):
+    from tests.conftest import synthetic_news
+
+    _settings, db = app_env
+    db.upsert_news(synthetic_news([("SPY,AAPL,MSFT", -15, "Broad rally lifts indices")]))
+    feed = da.news_feed(db)
+    assert len(feed) == 1
+    assert feed["symbols"].iloc[0] == "AAPL, MSFT, SPY"
+
+
+def test_top_news_symbols_ranks_by_article_count(app_env):
+    from tests.conftest import synthetic_news
+
+    _settings, db = app_env
+    articles = synthetic_news(
+        [("AAPL", -10, "One"), ("AAPL", -20, "Two"), ("TSLA", -30, "Three")]
+    )
+    db.upsert_news(articles)
+    top = da.top_news_symbols(db, hours=48)
+    assert top["symbol"].iloc[0] == "AAPL"
+    assert top["news_count"].iloc[0] == 2

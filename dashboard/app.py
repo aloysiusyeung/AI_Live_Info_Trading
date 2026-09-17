@@ -138,6 +138,11 @@ def render_sidebar(settings, db: Database) -> None:
             "bar": f"{settings.bar_minutes} min",
             "horizon": settings.horizon_label,
             "data feed": settings.data_feed,
+            "news": "market-wide (all US symbols)" if settings.news_enabled else "off",
+            "dynamic universe": (
+                f"up to {settings.max_dynamic_symbols} news-driven symbols"
+                if settings.dynamic_universe_enabled else "off"
+            ),
             "min confidence": settings.min_confidence,
             "cost assumption": f"{settings.round_trip_cost_bps:.0f} bps round trip",
         }
@@ -279,6 +284,13 @@ def render_symbol_detail(db: Database, settings) -> None:
 
     st.plotly_chart(charts.price_and_indicators(bars, benchmark), use_container_width=True)
 
+    symbol_news = da.news_for_symbol(db, symbol, limit=10)
+    if not symbol_news.empty:
+        with st.expander(f"Recent news for {symbol} ({len(symbol_news)} shown)", expanded=False):
+            display = symbol_news[["created_at", "headline", "source", "polarity"]].copy()
+            display.columns = ["Published", "Headline", "Source", "Tone"]
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
     preds = da.prediction_history(db, limit=500)
     left, right = st.columns([1.3, 1])
     with left:
@@ -300,6 +312,110 @@ def render_symbol_detail(db: Database, settings) -> None:
                 "Linear models show signed contributions; tree ensembles show "
                 "global importances, which indicate influence but not direction."
             )
+
+
+def render_news(db: Database, settings) -> None:
+    """Market-wide news, plus an honest view of news vs analysis coverage."""
+    st.subheader("News")
+    coverage = da.news_coverage(db)
+
+    if not coverage["articles"]:
+        st.info(
+            "No news ingested yet. Run `python -m stockbot.cli news --backfill` "
+            "to pull the market-wide feed."
+        )
+        return
+
+    cols = st.columns(5)
+    cols[0].metric("Articles stored", f"{coverage['articles']:,}")
+    cols[1].metric("Symbols in the news", f"{coverage['distinct_symbols']:,}")
+    assets = da.asset_stats(db)
+    cols[2].metric("Tradable US equities", f"{assets['tradable']:,}")
+    universe = da.analysis_universe(db)
+    cols[3].metric("Symbols analysed", f"{len(universe):,}" if not universe.empty else "0")
+    cols[4].metric("Latest article", da.age_text(coverage["last_article_at"]))
+
+    st.caption(
+        "News collection is **market-wide**: every article Alpaca returns is stored, "
+        "for every US symbol, regardless of the watchlist. Analysis is narrower — see "
+        "the coverage tab below for why."
+    )
+
+    if coverage.get("truncated_runs"):
+        st.warning(
+            f"{coverage['truncated_runs']} recent ingest run(s) hit the article cap, "
+            "so those windows are incomplete until later runs catch up. Raise "
+            "NEWS_MAX_PAGES or ingest more often.",
+            icon="⚠️",
+        )
+
+    tabs = st.tabs(["Market-wide feed", "Most covered symbols", "Coverage", "Ingest runs"])
+
+    with tabs[0]:
+        feed = da.news_feed(db, limit=150)
+        if feed.empty:
+            st.info("No articles stored.")
+        else:
+            display = feed[["created_at", "headline", "symbols", "source", "polarity"]].copy()
+            display.columns = ["Published", "Headline", "Symbols", "Source", "Tone"]
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.caption(
+                "Tone is a crude keyword score, not sentiment analysis: it counts "
+                "words from two hand-written lists with no handling of negation or "
+                "context. Do not read it as a judgement about a company."
+            )
+
+    with tabs[1]:
+        top = da.top_news_symbols(db, hours=settings.candidate_lookback_hours, limit=40)
+        if top.empty:
+            st.info("No symbol-tagged news in the lookback window.")
+        else:
+            display = top.copy()
+            display.columns = ["Symbol", "Articles", "Latest article"]
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.caption(
+                f"Over the last {settings.candidate_lookback_hours}h. Symbols here are "
+                "candidates for the analysis universe; admission also needs "
+                "tradability and spare capacity."
+            )
+
+    with tabs[2]:
+        st.markdown("**Why is news coverage wider than analysis coverage?**")
+        st.markdown(
+            f"""
+Every article for every US symbol is collected. Producing a *signal*, though,
+needs months of bar history plus a model that has passed walk-forward
+validation — per symbol. There are roughly eleven thousand listed US equities,
+and training and refreshing that many models every ten minutes is not feasible,
+so a cap is applied rather than shipping unvalidated models.
+
+- **Always analysed:** the configured watchlist (`{', '.join(settings.watchlist)}`)
+- **Added dynamically:** up to **{settings.max_dynamic_symbols}** symbols the news
+  is most active on, provided they are tradable on Alpaca
+- **Everything else:** news is still collected and stored, but no signal is produced
+            """
+        )
+        if not universe.empty:
+            display = universe[["symbol", "source", "news_count", "rank", "admitted", "reason"]]
+            display.columns = ["Symbol", "Source", "Articles", "News rank", "Analysed", "Reason"]
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            dropped = universe[universe["admitted"] == 0]
+            if not dropped.empty:
+                st.caption(
+                    f"{len(dropped)} news-active symbol(s) were not analysed this cycle. "
+                    "The reason column says whether that was capacity or tradability."
+                )
+        else:
+            st.info("No universe snapshot yet; run a cycle.")
+
+    with tabs[3]:
+        runs = da.news_runs(db)
+        if runs.empty:
+            st.info("No ingest runs recorded.")
+        else:
+            display = runs[["started_at", "status", "articles_seen", "articles_stored",
+                            "symbols_seen", "truncated", "window_start"]]
+            st.dataframe(display, use_container_width=True, hide_index=True)
 
 
 def render_positions_and_orders(db: Database, broker: dict) -> None:
@@ -486,6 +602,15 @@ def render_risk_notice() -> None:
   spreads and volumes differ from SIP data.
 - **Paper fills are not real fills.** Alpaca's paper engine does not reproduce
   queue position, partial-fill dynamics or market impact.
+- **News coverage is not analysis coverage.** Every US symbol's news is stored,
+  but only the watchlist plus a capped set of news-active symbols get a model
+  and a signal. Everything else is collected and not acted on.
+- **"Tone" is not sentiment.** It is a keyword count from two hand-written word
+  lists, with no negation handling and no validation against labelled data.
+- **News timestamps are trusted as given.** Features use each article's
+  publication time, but a story can become queryable slightly later than it
+  claims to have been published, which would make backtested news features
+  marginally optimistic.
             """
         )
 
@@ -509,6 +634,8 @@ def main() -> None:
     render_signals(db, settings)
     st.divider()
     render_symbol_detail(db, settings)
+    st.divider()
+    render_news(db, settings)
     st.divider()
     render_positions_and_orders(db, broker)
     st.divider()

@@ -14,6 +14,13 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .news_features import (
+    NEWS_FEATURE_COLUMNS,
+    NEWS_FEATURE_DESCRIPTIONS,
+    NewsIndex,
+    build_news_features,
+)
+
 logger = logging.getLogger(__name__)
 
 #: Ordered list of engineered feature columns handed to the models.
@@ -31,6 +38,9 @@ FEATURE_COLUMNS: list[str] = [
     "spy_ret_12", "spy_relative_12", "spy_relative_39", "beta_78",
     "minutes_since_open", "session_progress", "is_first_hour", "is_last_hour",
     "day_of_week",
+    # News features. Absent when the news store is empty, in which case they
+    # come back NaN and prepare_training_frame drops them.
+    *NEWS_FEATURE_COLUMNS,
 ]
 
 #: Human-readable descriptions used by the explanation generator.
@@ -69,6 +79,7 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
     "is_first_hour": "first hour of the session",
     "is_last_hour": "last hour of the session",
     "day_of_week": "day of week",
+    **NEWS_FEATURE_DESCRIPTIONS,
 }
 
 
@@ -123,6 +134,9 @@ def build_features(
     benchmark: pd.DataFrame | None = None,
     tz: str = "America/New_York",
     session_minutes: dict | None = None,
+    news_index: "NewsIndex | None" = None,
+    bar_minutes: int = 10,
+    symbol: str | None = None,
 ) -> pd.DataFrame:
     """Engineer the full feature matrix for one symbol.
 
@@ -139,6 +153,12 @@ def build_features(
         Alpaca's calendar, which correctly shortens early-close days. The
         schedule is published in advance, so using it is not look-ahead. Without
         it, every session is assumed to be a full 390 minutes.
+    news_index:
+        Optional market-wide news index. When given, news features are computed
+        as-of each bar's close; when omitted they are NaN and later dropped.
+    symbol:
+        Symbol to look up in ``news_index``. Defaults to the frame's own symbol
+        column.
     """
     if bars is None or bars.empty:
         return pd.DataFrame(columns=["bar_start", *FEATURE_COLUMNS])
@@ -256,6 +276,16 @@ def build_features(
     df["is_first_hour"] = (minutes_since_open < 60).astype(float)
     df["is_last_hour"] = (minutes_since_open >= (length - 60)).astype(float)
     df["day_of_week"] = local.dt.dayofweek.astype(float)
+
+    # --- news (market-wide store, queried as-of each bar close) -------------
+    resolved_symbol = symbol
+    if resolved_symbol is None and "symbol" in df.columns and len(df):
+        resolved_symbol = str(df["symbol"].iloc[0])
+    news = build_news_features(
+        df["bar_start"], resolved_symbol or "", news_index, bar_minutes
+    )
+    for column in NEWS_FEATURE_COLUMNS:
+        df[column] = news[column].to_numpy()
 
     df = df.drop(columns=["_session"])
     return df.replace([np.inf, -np.inf], np.nan)
