@@ -230,10 +230,72 @@ per-symbol cap, the most conservative fixed allocation on offer.
 
 ## Setup
 
+Clone the repository — do not download files individually, or you will miss the
+package layout, the exec bits on `scripts/`, and `.gitignore`.
+
 ```bash
-git clone <this repo> && cd AI_Live_Info_Trading
+git clone https://github.com/aloysiusyeung/AI_Live_Info_Trading.git
+cd AI_Live_Info_Trading
+git checkout claude/alpaca-paper-trading-analyzer-b7o4d3
 ./scripts/setup.sh          # venv, dependencies, .env scaffold, tests
 ```
+
+### macOS (including Apple Silicon)
+
+macOS ships Python 3.9, which is **too old** — the pinned pandas, numpy and
+scikit-learn versions have no 3.9 wheels. `setup.sh` checks this and stops with
+a clear message rather than failing deep inside pip.
+
+```bash
+# 1. Homebrew, if you do not have it
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# 2. A supported Python (3.11 or 3.12 are the safest choices)
+brew install python@3.12
+
+# 3. Clone
+git clone https://github.com/aloysiusyeung/AI_Live_Info_Trading.git
+cd AI_Live_Info_Trading
+git checkout claude/alpaca-paper-trading-analyzer-b7o4d3
+
+# 4. Set up against that interpreter
+PYTHON="$(brew --prefix)/bin/python3.12" ./scripts/setup.sh
+
+# 5. Add your Alpaca PAPER keys
+cp .env.example .env    # setup.sh does this too
+open -e .env            # fill in ALPACA_API_KEY and ALPACA_SECRET_KEY
+
+# 6. Verify, load data, run
+./scripts/check_connection.sh    # read-only; submits no orders
+./scripts/bootstrap_data.sh      # news + bars + model training
+./scripts/run_dashboard.sh       # http://127.0.0.1:8501
+```
+
+No Rosetta and no Xcode project are needed; arm64 wheels exist for every
+dependency. If pip ever tries to *build* numpy or pandas from source, you are on
+the wrong Python version — go back to step 2.
+
+Everything runs locally: the SQLite database, the models and the logs all stay
+in the working directory. The only outbound traffic is to Alpaca.
+
+#### The laptop-sleep problem
+
+**A MacBook that sleeps does not run the scheduler.** Closing the lid stops the
+10-minute cycle, and APScheduler drops ticks missed beyond its grace window
+rather than replaying them. On wake, bars and news catch up automatically from
+their watermarks, so the *data* has no hole — but no signals exist for the bars
+that passed while the machine was asleep, and no orders could have been placed.
+
+For casual use, keep it plugged in and awake while you want it running:
+
+```bash
+caffeinate -s ./scripts/run_scheduler.sh
+```
+
+For anything you actually intend to rely on, run the scheduler on a machine that
+stays awake — a small always-on box, or Docker on a server (see
+[Deployment](#deployment-keeping-the-scheduler-running)). A laptop is fine for
+watching the dashboard and reading signals; it is a poor host for a schedule.
 
 Then put your **paper** keys in `.env` (or export them):
 
@@ -399,8 +461,11 @@ ExecStart=/opt/stockbot/.venv/bin/streamlit run dashboard/app.py \
 Restart=always
 ```
 
-Bind the dashboard to `127.0.0.1` and put it behind a reverse proxy with
-authentication — it exposes the emergency stop and your positions.
+`run_dashboard.sh` binds `127.0.0.1` by default, because the dashboard shows
+your positions and carries the emergency stop. Setting
+`STREAMLIT_ADDRESS=0.0.0.0` serves it to whatever network the machine is on —
+do that only behind a reverse proxy with authentication. The script prints a
+warning if you do.
 
 ### Docker Compose
 
@@ -427,6 +492,48 @@ services:
 
 Both containers must share the `data/` volume — they talk through the SQLite
 file, which runs in WAL mode for concurrent readers.
+
+### launchd (macOS)
+
+`launchd` is the macOS equivalent of systemd. Save as
+`~/Library/LaunchAgents/com.stockbot.scheduler.plist`, replacing `YOU` with your
+short username:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.stockbot.scheduler</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/AI_Live_Info_Trading/.venv/bin/python</string>
+    <string>-m</string><string>stockbot.cli</string><string>run</string>
+    <string>--train-on-start</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/YOU/AI_Live_Info_Trading</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/YOU/AI_Live_Info_Trading/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOU/AI_Live_Info_Trading/logs/launchd.err.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load -w ~/Library/LaunchAgents/com.stockbot.scheduler.plist
+launchctl list | grep stockbot
+tail -f logs/launchd.err.log            # structured JSON logs
+launchctl unload -w ~/Library/LaunchAgents/com.stockbot.scheduler.plist
+```
+
+`launchd` does not read `.env`, and putting credentials in a plist would leave
+them in a world-readable file. Keep them in `.env`, which the application loads
+itself through `python-dotenv` — that is why `WorkingDirectory` matters.
+
+`KeepAlive` restarts the process after a crash, but it cannot run it while the
+machine is asleep. See [the laptop-sleep problem](#the-laptop-sleep-problem).
 
 ### supervisor
 
