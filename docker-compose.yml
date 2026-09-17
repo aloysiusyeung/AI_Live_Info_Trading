@@ -1,0 +1,28 @@
+# Scheduler and dashboard share the SQLite file through the data/ volume.
+services:
+  scheduler:
+    build: .
+    command: python -m stockbot.cli run --train-on-start
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./models_store:/app/models_store
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: >
+      streamlit run dashboard/app.py
+      --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    env_file: .env
+    ports:
+      # Bound to loopback: the dashboard exposes positions and the kill switch.
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./models_store:/app/models_store
+    depends_on:
+      - scheduler
+    restart: unless-stopped
